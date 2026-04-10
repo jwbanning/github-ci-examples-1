@@ -1,0 +1,471 @@
+name: Sync Postman Spec with GitHub File
+
+on:
+  workflow_dispatch:
+    inputs:
+      spec_id:
+        description: 'Postman Spec ID (UID)'
+        required: true
+        type: string
+      collection_id:
+        description: 'Postman Collection ID (UID)'
+        required: false
+        type: string
+      file_path:
+        description: 'Path to file in repository (e.g., postman/schemas/accounts.yaml)'
+        required: true
+        type: string
+      sync_direction:
+        description: 'Sync direction'
+        required: true
+        type: choice
+        options:
+          - 'repo-to-postman'
+          - 'postman-to-repo'
+          - 'both'
+        default: 'both'
+      create_pr:
+        description: 'Create Pull Request for changes (if syncing to repo)'
+        required: false
+        type: boolean
+        default: true
+      debug:
+        description: 'Enable debug mode (saves artifacts for troubleshooting)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
+
+jobs:
+  sync-spec:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate Inputs
+        run: |
+          echo "::group::Input Parameters"
+          echo "Spec ID: ${{ inputs.spec_id }}"
+          echo "Collection ID: ${{ inputs.collection_id }}"
+          echo "File Path: ${{ inputs.file_path }}"
+          echo "Sync Direction: ${{ inputs.sync_direction }}"
+          echo "Create PR: ${{ inputs.create_pr }}"
+          echo "Debug Mode: ${{ inputs.debug }}"
+          echo "::endgroup::"
+          
+          # Check if file exists (for repo-to-postman sync)
+          if [[ "${{ inputs.sync_direction }}" == "repo-to-postman" ]] || [[ "${{ inputs.sync_direction }}" == "both" ]]; then
+            if [ ! -f "${{ inputs.file_path }}" ]; then
+              echo "::error::File '${{ inputs.file_path }}' not found in repository"
+              exit 1
+            fi
+            
+            # Show file info
+            echo "::group::File Information"
+            echo "File size: $(wc -c < "${{ inputs.file_path }}") bytes"
+            echo "Line count: $(wc -l < "${{ inputs.file_path }}") lines"
+            file_path="${{ inputs.file_path }}"
+            file_ext="${file_path##*.}"
+            echo "File extension: $file_ext"
+            
+            # Validate file type
+            if [[ "$file_ext" != "yaml" ]] && [[ "$file_ext" != "yml" ]] && [[ "$file_ext" != "json" ]]; then
+              echo "::warning::File extension is not .yaml, .yml, or .json. This may not be a valid API spec."
+            fi
+            echo "::endgroup::"
+          fi
+
+      - name: Get Postman Spec
+        id: get-spec
+        run: |
+          echo "Fetching spec from Postman..."
+          
+          response=$(curl -s -w "\n%{http_code}" \
+            -X GET "https://api.postman.com/specs/${{ inputs.spec_id }}" \
+            -H "X-Api-Key: ${{ secrets.POSTMAN_API_KEY }}" \
+            -H "Accept: application/vnd.api.v10+json")
+          
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          
+          if [ "$http_code" -ne 200 ]; then
+            echo "::error::Failed to fetch spec from Postman (HTTP $http_code)"
+            echo "Response: $body"
+            exit 1
+          fi
+          
+          echo "Spec fetched successfully"
+          echo "$body" > /tmp/postman_spec.json
+          
+          # Extract spec name and metadata
+          # spec_name=$(echo "$body" | jq -r '.spec.name // "Unknown"')
+          # spec_type=$(echo "$body" | jq -r '.spec.type // "Unknown"')
+          
+          # echo "spec_name=$spec_name" >> $GITHUB_OUTPUT
+          # echo "spec_type=$spec_type" >> $GITHUB_OUTPUT
+          
+          echo "::group::Spec Details"
+          echo "Name: $spec_name"
+          echo "Type: $spec_type"
+          echo "::endgroup::"
+
+      - name: Get Spec Definition
+        id: get-definition
+        run: |
+          echo "Fetching spec definition..."
+          
+          response=$(curl -s -w "\n%{http_code}" \
+            -X GET "https://api.postman.com/specs/${{ inputs.spec_id }}/files" \
+            -H "X-Api-Key: ${{ secrets.POSTMAN_API_KEY }}" \
+            -H "Accept: application/vnd.api.v10+json")
+          
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          
+          if [ "$http_code" -ne 200 ]; then
+            echo "::warning::Could not fetch spec files (HTTP $http_code)"
+          else
+            echo "$body" > /tmp/spec_files.json
+            
+            # Get the root file path
+            root_file=$(echo "$body" | jq -r '.files[] | select(.type == "ROOT") | .path')
+            echo "root_file=$root_file" >> $GITHUB_OUTPUT
+            
+            if [ -n "$root_file" ]; then
+              echo "Root file: $root_file"
+              
+              # Get the content of the root file
+              file_response=$(curl -s -w "\n%{http_code}" \
+                -X GET "https://api.postman.com/specs/${{ inputs.spec_id }}/files/$root_file" \
+                -H "X-Api-Key: ${{ secrets.POSTMAN_API_KEY }}" \
+                -H "Accept: application/vnd.api.v10+json")
+              
+              file_http_code=$(echo "$file_response" | tail -n1)
+              file_body=$(echo "$file_response" | sed '$d')
+              
+              if [ "$file_http_code" -eq 200 ]; then
+                echo "$file_body" | jq -r '.content' > /tmp/postman_spec_content.txt
+                echo "✓ Spec content retrieved"
+              fi
+            fi
+          fi
+
+      - name: Compare and Sync (Postman to Repo)
+        if: inputs.sync_direction == 'postman-to-repo' || inputs.sync_direction == 'both'
+        id: sync-to-repo
+        run: |
+          echo "::group::Syncing from Postman to Repository"
+          
+          if [ ! -f "/tmp/postman_spec_content.txt" ]; then
+            echo "::error::Could not retrieve spec content from Postman"
+            exit 1
+          fi
+          
+          # Check if file exists in repo
+          if [ -f "${{ inputs.file_path }}" ]; then
+            # Compare files
+            if diff -q "${{ inputs.file_path }}" /tmp/postman_spec_content.txt > /dev/null; then
+              echo "✓ Files are identical - no sync needed"
+              echo "changed=false" >> $GITHUB_OUTPUT
+            else
+              echo "Files differ - syncing from Postman to repo"
+              cp /tmp/postman_spec_content.txt "${{ inputs.file_path }}"
+              echo "changed=true" >> $GITHUB_OUTPUT
+              
+              echo "::group::Changes"
+              diff -u "${{ inputs.file_path }}" /tmp/postman_spec_content.txt || true
+              echo "::endgroup::"
+            fi
+          else
+            echo "File doesn't exist in repo - creating from Postman spec"
+            mkdir -p "$(dirname "${{ inputs.file_path }}")"
+            cp /tmp/postman_spec_content.txt "${{ inputs.file_path }}"
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "::endgroup::"
+
+      - name: Prepare Sync Payload (Repo to Postman)
+        if: inputs.sync_direction == 'repo-to-postman' || inputs.sync_direction == 'both'
+        id: prepare-sync
+        run: |
+          echo "::group::Preparing Sync from Repository to Postman"
+          
+          if [ ! -f "${{ inputs.file_path }}" ]; then
+            echo "::error::File '${{ inputs.file_path }}' not found in repository"
+            exit 1
+          fi
+          
+          # Check if content differs
+          needs_update=false
+          if [ -f "/tmp/postman_spec_content.txt" ]; then
+            if diff -q "${{ inputs.file_path }}" /tmp/postman_spec_content.txt > /dev/null; then
+              echo "✓ Files are identical - no sync needed"
+              echo "needs_sync=false" >> $GITHUB_OUTPUT
+            else
+              echo "Files differ - preparing sync payload"
+              needs_update=true
+            fi
+          else
+            echo "No existing spec content found - preparing sync payload"
+            needs_update=true
+          fi
+          
+          if [ "$needs_update" = true ]; then
+            echo "needs_sync=true" >> $GITHUB_OUTPUT
+            
+            # Get the root file path
+            root_file=$(cat /tmp/spec_files.json | jq -r '.files[] | select(.type == "ROOT") | .path')
+            
+            if [ -z "$root_file" ]; then
+              echo "::error::Could not determine root file path"
+              exit 1
+            fi
+            
+            echo "Root file path: $root_file"
+            
+            # Read file content and properly stringify for JSON
+            # This converts the raw content to a JSON string with escaped newlines, quotes, etc.
+            echo "Reading and stringifying file content..."
+            file_content=$(cat "${{ inputs.file_path }}" | jq -Rs .)
+            
+            # Verify stringification
+            if [ -z "$file_content" ] || [ "$file_content" = "null" ]; then
+              echo "::error::Failed to read or stringify file content"
+              exit 1
+            fi
+            
+            # Show preview of stringified content (first 200 chars)
+            echo "::group::Stringified Content Preview"
+            echo "First 200 characters of stringified content:"
+            echo "$file_content" | head -c 200
+            echo "..."
+            echo "::endgroup::"
+            
+            # Create JSON payload
+            json_payload=$(jq -n \
+              --argjson content "$file_content" \
+              '{content: $content}')
+            
+            echo "::group::JSON Payload Preview"
+            echo "First 200 characters of JSON payload:"
+            echo "$json_payload" | head -c 200
+            echo "..."
+            echo "::endgroup::"
+            
+            # Save artifacts for debugging BEFORE attempting sync
+            # This ensures artifacts are available even if the API call fails
+            echo "Saving stringified content and payload as artifacts..."
+            mkdir -p /tmp/sync-artifacts
+            echo "$file_content" > /tmp/sync-artifacts/stringified-content.txt
+            echo "$json_payload" > /tmp/sync-artifacts/json-payload.json
+            echo "${{ inputs.file_path }}" > /tmp/sync-artifacts/source-file-path.txt
+            echo "${{ inputs.spec_id }}" > /tmp/sync-artifacts/spec-id.txt
+            echo "root_file=$root_file" >> /tmp/sync-artifacts/metadata.txt
+            echo "sync_timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> /tmp/sync-artifacts/metadata.txt
+            echo "needs_sync=true" >> /tmp/sync-artifacts/metadata.txt
+            echo "✓ Artifacts saved to /tmp/sync-artifacts"
+          else
+            echo "needs_sync=false" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "::endgroup::"
+
+      - name: Upload Sync Artifacts
+        if: steps.prepare-sync.outputs.needs_sync == 'true' && inputs.debug == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: postman-sync-artifacts-${{ github.run_id }}
+          path: /tmp/sync-artifacts/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Set No Sync Output
+        if: steps.prepare-sync.outputs.needs_sync == 'false'
+        id: no-sync
+        run: |
+          echo "changed=false" >> $GITHUB_OUTPUT
+
+      - name: Sync to Postman API
+        if: steps.prepare-sync.outputs.needs_sync == 'true'
+        id: sync-to-postman-api
+        run: |
+          echo "::group::Syncing to Postman API"
+          
+          # Read the prepared payload
+          json_payload=$(cat /tmp/sync-artifacts/json-payload.json)
+          root_file=$(grep "root_file=" /tmp/sync-artifacts/metadata.txt | cut -d'=' -f2)
+          
+          # Update the spec file
+          echo "Sending update to Postman API..."
+          update_response=$(curl -s -w "\n%{http_code}" \
+            -X PATCH "https://api.postman.com/specs/${{ inputs.spec_id }}/files/$root_file" \
+            -H "X-Api-Key: ${{ secrets.POSTMAN_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/vnd.api.v10+json" \
+            -d "$json_payload")
+          
+          update_http_code=$(echo "$update_response" | tail -n1)
+          update_body=$(echo "$update_response" | sed '$d')
+          
+          # Save API response to artifacts
+          echo "$update_body" > /tmp/sync-artifacts/api-response.json
+          echo "http_status=$update_http_code" >> /tmp/sync-artifacts/metadata.txt
+          echo "api_endpoint=/specs/${{ inputs.spec_id }}/files/$root_file" >> /tmp/sync-artifacts/metadata.txt
+          
+          if [ "$update_http_code" -eq 200 ] || [ "$update_http_code" -eq 204 ]; then
+            echo "✓ Spec updated successfully in Postman"
+            echo "sync_status=success" >> /tmp/sync-artifacts/metadata.txt
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "::error::Failed to update spec in Postman (HTTP $update_http_code)"
+            echo "::group::API Response"
+            echo "$update_body" | jq '.' 2>/dev/null || echo "$update_body"
+            echo "::endgroup::"
+            echo "sync_status=failed" >> /tmp/sync-artifacts/metadata.txt
+            exit 1
+          fi
+
+                    # Sync collection with spec
+          echo "Syncing collection with spec..."
+          
+          if [ -n "${{ inputs.collection_id }}" ]; then
+            collection_response=$(curl -s -w "\n%{http_code}" \
+              -X PUT "https://api.postman.com/collections/${{ inputs.collection_id }}/synchronizations?specId=${{ inputs.spec_id }}" \
+              -H "X-Api-Key: ${{ secrets.POSTMAN_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/vnd.api.v10+json")
+            
+            collection_http_code=$(echo "$collection_response" | tail -n1)
+            collection_body=$(echo "$collection_response" | sed '$d')
+            
+            # Save API response to artifacts
+            echo "$collection_body" > /tmp/sync-artifacts/collection-sync-response.json
+            echo "collection_sync_http_status=$collection_http_code" >> /tmp/sync-artifacts/metadata.txt
+            
+            if [ "$collection_http_code" -eq 200 ] || [ "$collection_http_code" -eq 204 ]; then
+              echo "✓ Collection synced successfully with spec"
+              echo "collection_sync_status=success" >> /tmp/sync-artifacts/metadata.txt
+            else
+              echo "::warning::Failed to sync collection with spec (HTTP $collection_http_code)"
+              echo "::group::Collection Sync Response"
+              echo "$collection_body" | jq '.' 2>/dev/null || echo "$collection_body"
+              echo "::endgroup::"
+              echo "collection_sync_status=failed" >> /tmp/sync-artifacts/metadata.txt
+            fi
+          else
+            echo "::warning::Collection ID not provided - skipping collection sync"
+            echo "collection_sync_status=skipped" >> /tmp/sync-artifacts/metadata.txt
+          fi
+          
+          echo "::endgroup::"
+
+      - name: Create Pull Request
+        if: |
+          (inputs.sync_direction == 'postman-to-repo' || inputs.sync_direction == 'both') &&
+          steps.sync-to-repo.outputs.changed == 'true' &&
+          inputs.create_pr == true
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: 'sync: Update ${{ inputs.file_path }} from Postman spec'
+          branch: sync-postman-spec-${{ inputs.spec_id }}
+          delete-branch: true
+          title: 'Sync: Update spec from Postman (${{ inputs.spec_id }})'
+          body: |
+            ## 🔄 Postman Spec Synchronization
+            
+            This PR synchronizes the specification file with the latest version from Postman.
+            
+            ### Details
+            - **Spec ID:** `${{ inputs.spec_id }}`
+            - **File:** `${{ inputs.file_path }}`
+            - **Sync Direction:** Postman → Repository
+            
+            ### Changes
+            The specification file has been updated to match the latest version in Postman.
+            
+            ---
+            *Automated by GitHub Actions - [View Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*
+          labels: |
+            sync
+            postman
+            automated
+          reviewers: |
+            ${{ github.actor }}
+
+      - name: Commit Changes (No PR)
+        if: |
+          (inputs.sync_direction == 'postman-to-repo' || inputs.sync_direction == 'both') &&
+          steps.sync-to-repo.outputs.changed == 'true' &&
+          inputs.create_pr == false
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          git add "${{ inputs.file_path }}"
+          git commit -m "sync: Update ${{ inputs.file_path }} from Postman spec ${{ inputs.spec_id }}"
+          git push
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 🔄 Postman Spec Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Spec ID:** \`${{ inputs.spec_id }}\`" >> $GITHUB_STEP_SUMMARY
+          # echo "**Spec Name:** ${{ steps.get-spec.outputs.spec_name }}" >> $GITHUB_STEP_SUMMARY
+          # echo "**File Path:** \`${{ inputs.file_path }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Sync Direction:** ${{ inputs.sync_direction }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.sync-to-repo.outputs.changed }}" = "true" ]; then
+            echo "✅ **Repository updated** from Postman spec" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Check for postman sync changes
+          postman_changed="${{ steps.sync-to-postman-api.outputs.changed }}"
+          no_sync="${{ steps.no-sync.outputs.changed }}"
+          
+          if [ "$postman_changed" = "true" ]; then
+            echo "✅ **Postman spec updated** from repository" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Determine if no changes were needed
+          repo_changed="${{ steps.sync-to-repo.outputs.changed }}"
+          if [ "$repo_changed" = "false" ] && ([ "$postman_changed" = "false" ] || [ "$no_sync" = "false" ]); then
+            echo "✅ **No changes needed** - files are already in sync" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Add artifacts info if debug mode is enabled
+          if [ "${{ inputs.debug }}" = "true" ]; then
+            if [[ "${{ inputs.sync_direction }}" == "repo-to-postman" ]] || [[ "${{ inputs.sync_direction }}" == "both" ]]; then
+              if [ -d "/tmp/sync-artifacts" ]; then
+                echo "### 📦 Debug Artifacts" >> $GITHUB_STEP_SUMMARY
+                echo "Debug mode enabled - artifacts saved for troubleshooting." >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "**Artifact name:** \`postman-sync-artifacts-${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "**Includes:**" >> $GITHUB_STEP_SUMMARY
+                echo "- \`stringified-content.txt\` - The raw stringified file content" >> $GITHUB_STEP_SUMMARY
+                echo "- \`json-payload.json\` - The complete JSON payload sent to Postman API" >> $GITHUB_STEP_SUMMARY
+                echo "- \`source-file-path.txt\` - The source file path" >> $GITHUB_STEP_SUMMARY
+                echo "- \`spec-id.txt\` - The Postman spec ID" >> $GITHUB_STEP_SUMMARY
+                echo "- \`metadata.txt\` - Sync metadata (timestamp, root file, status)" >> $GITHUB_STEP_SUMMARY
+                echo "- \`api-response.json\` - Postman API response (if sync was attempted)" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          fi
+
